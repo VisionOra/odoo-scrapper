@@ -29,8 +29,7 @@ See [SPECIFICATION.md](SPECIFICATION.md) for the design rationale and
 | `odoo_extract/crypto.py` | AES (Fernet) encryption at rest |
 | `odoo_extract/control_health.py` | Fail-closed redaction self-test |
 | `tests/` | Browser-free unit tests (parsing, sanitizer, predicates, config, audit, crypto) |
-| `requirements.txt` | Pinned runtime dependencies |
-| `requirements-dev.txt` | Adds the test toolchain (`pytest`) |
+| `requirements.txt` | Pinned dependencies (runtime + dev tooling) |
 | `.env.example` | Configuration template (copy to `.env`) |
 
 The `odoo_extract` package is organized one responsibility per module:
@@ -43,8 +42,7 @@ small and single-purpose.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt        # runtime only
-# or: pip install -r requirements-dev.txt   # runtime + test tooling
+pip install -r requirements.txt        # runtime + dev tooling (pytest, hooks)
 playwright install chromium
 
 cp .env.example .env        # then fill in ODOO_URL / EMAIL / PASSWORD
@@ -156,7 +154,7 @@ hash-chain (including tamper detection), and the AES round-trip + fail-closed
 self-test:
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 pytest
 ```
 

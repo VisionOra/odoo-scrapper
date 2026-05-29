@@ -1,4 +1,8 @@
+# Runtime
 playwright==1.49.1
 python-dotenv==1.0.1
 cryptography==44.0.0
+
+# Dev / tooling (lint hooks + tests)
 pre-commit==4.0.1
+pytest==8.3.4
