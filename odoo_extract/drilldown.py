@@ -60,9 +60,7 @@ async def extract_all_target_invoices(
 
     invoices: list[Invoice] = []
     for index in range(total):
-        invoices.append(
-            await _extract_one(page, cfg, capture, log, index, total)
-        )
+        invoices.append(await _extract_one(page, cfg, capture, log, index, total))
         # Return to the list for the next iteration (state-driven, no sleep).
         if index < total - 1:
             await _back_to_list(page, log)

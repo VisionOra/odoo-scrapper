@@ -38,9 +38,7 @@ async def clear_default_filters(page: Page, log) -> None:
     button, located structurally (role/text), never by generated id.
     """
     # Search bar container — role-based with class fallback (Odoo 16→19).
-    search_box = page.locator(
-        '[role="search"], .o_searchview, .o_cp_searchview'
-    ).first
+    search_box = page.locator('[role="search"], .o_searchview, .o_cp_searchview').first
     await search_box.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
 
     # Each facet exposes a remove control. In Odoo 19 it carries an aria-label
@@ -49,7 +47,7 @@ async def clear_default_filters(page: Page, log) -> None:
     # fresh search_read which the list awaits via re-render (no sleep).
     while True:
         facet_remove = search_box.locator(
-            '.o_facet_remove, .o_searchview_facet .o_facet_remove, '
+            ".o_facet_remove, .o_searchview_facet .o_facet_remove, "
             'button[aria-label="Remove"], [role="img"][aria-label="Remove"]'
         )
         if await facet_remove.count() == 0:
@@ -115,7 +113,7 @@ async def _apply_posted_via_dropdown(page: Page, log) -> bool:
 async def _apply_posted_via_search(page: Page, log) -> bool:
     search_input = page.locator(
         '[role="search"] input, .o_searchview input.o_searchview_input, '
-        '.o_cp_searchview input'
+        ".o_cp_searchview input"
     ).first
     await search_input.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
     await search_input.click()

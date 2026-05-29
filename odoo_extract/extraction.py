@@ -26,7 +26,9 @@ async def extract_invoice_lines(
     chosen = primary if primary else fallback
 
     if not chosen:
-        raise ExtractionError("No invoice lines could be extracted (RPC and DOM empty).")
+        raise ExtractionError(
+            "No invoice lines could be extracted (RPC and DOM empty)."
+        )
 
     # Reconciliation: warn (sanitized) if the two sources disagree on count.
     if primary and fallback and len(primary) != len(fallback):
@@ -78,9 +80,7 @@ async def _open_invoice_lines_tab(page: Page, log) -> None:
         await table.wait_for(state="visible", timeout=15_000)
         log.info("Invoice Lines tab active; lines table visible.")
     except PWTimeout:
-        log.warning(
-            "Invoice Lines table not located in DOM; relying on RPC capture."
-        )
+        log.warning("Invoice Lines table not located in DOM; relying on RPC capture.")
 
 
 def _lines_from_rpc(capture: RpcCapture) -> list[InvoiceLine]:
@@ -94,7 +94,6 @@ def _lines_from_rpc(capture: RpcCapture) -> list[InvoiceLine]:
 
     lines: list[InvoiceLine] = []
     for ln in raw_lines:
-        
         dtype = ln.get("display_type")
         if dtype not in (False, None, "", "product"):
             continue

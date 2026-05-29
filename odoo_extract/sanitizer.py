@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -45,7 +44,9 @@ class PhiRedactionFilter(logging.Filter):
         return True
 
 
-def build_logger(name: str = "erp-extract") -> tuple[logging.Logger, PhiRedactionFilter]:
+def build_logger(
+    name: str = "erp-extract",
+) -> tuple[logging.Logger, PhiRedactionFilter]:
     """Create a console logger guarded by the PHI redaction filter."""
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
