@@ -1,0 +1,9 @@
+.env
+.pw-profile/
+__pycache__/
+*.pyc
+invoice_lines.json
+trace.zip
+*.png
+.venv/
+venv/
