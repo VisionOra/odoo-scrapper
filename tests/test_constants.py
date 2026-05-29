@@ -73,7 +73,8 @@ def test_read_predicate_scoped_to_account_move():
 
 def test_read_predicate_allows_unknown_model():
     # Model undeterminable but method is a read -> accepted (capture filters).
-    unknown = _resp(f"{CALL_KW}/web_read")
+    # Bare endpoint form: /web/dataset/web_read (no call_kw segment, no body).
+    unknown = _resp("https://x.odoo.com/web/dataset/web_read")
     model, method = rpc_meta(unknown)
     assert method == "web_read" and model is None
     assert is_read_response(unknown) is True

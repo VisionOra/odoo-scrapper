@@ -12,6 +12,8 @@ from typing import Iterator
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from . import crypto
+from .audit import PhiAuditLog, pseudonymize
 from .auth import authenticate
 from .config import Config
 from .constants import NAV_TIMEOUT_MS
@@ -71,12 +73,16 @@ def _profile_lock(user_data_dir: str, log: logging.Logger) -> Iterator[None]:
 
 
 async def run(
-    cfg: Config, log: logging.Logger, redactor: PhiRedactionFilter
+    cfg: Config,
+    log: logging.Logger,
+    redactor: PhiRedactionFilter,
+    audit: PhiAuditLog,
 ) -> list[Invoice]:
     # Register PHI terms up front so anything logged later is auto-redacted.
     # Product names are registered incrementally inside extraction (§7), the
     # moment they exist — not after the fact.
     redactor.register([cfg.target_customer], "[REDACTED_CUSTOMER]")
+    subject = pseudonymize(cfg.target_customer)  # audit by pseudonym, never name
 
     sandbox_args = ["--no-sandbox"] if cfg.no_sandbox else []
 
@@ -108,6 +114,7 @@ async def run(
                     what="Authentication",
                     log=log,
                 )
+                audit.record("AUTH", outcome="SUCCESS", detail="session established")
                 await with_retries(
                     lambda: open_invoicing(page, cfg, log),
                     what="Opening Invoicing",
@@ -116,7 +123,7 @@ async def run(
                 await clear_default_filters(page, log)
                 await apply_posted_filter(page, log)
                 invoices = await extract_all_target_invoices(
-                    page, cfg, capture, log, redactor
+                    page, cfg, capture, log, redactor, audit, subject
                 )
 
                 if tracing:
@@ -151,26 +158,57 @@ async def _dump_artifacts(
     log.info("Saved failure artifacts (failure.png, trace.zip) — contain raw data.")
 
 
-def write_output(invoices: list[Invoice], cfg: Config, log: logging.Logger) -> None:
-    """Serialize REAL values straight to disk — never through the logger (§7).
+def write_output(
+    invoices: list[Invoice],
+    cfg: Config,
+    log: logging.Logger,
+    audit: PhiAuditLog,
+) -> str:
+    """Serialize REAL values to disk — encrypted at rest, atomically (§7).
 
-    The write is atomic: data goes to a temp file in the same directory which is
-    then ``os.replace``-d over the target, so a crash mid-write can never leave a
-    truncated/corrupt JSON file. Output is an array of invoices, each with its
-    own lines, so multiple invoices for the same customer are distinct.
+    PHI never flows through the logger. When ``encrypt_output`` is on, the JSON
+    is AES-encrypted (Fernet) before it touches disk (§164.312(a)(2)(iv)); the
+    file is written to a temp path then ``os.replace``-d (atomic, no truncated
+    output) and locked to ``0600``. Returns the path actually written.
     """
     payload = [asdict(inv) for inv in invoices]
+    plaintext = json.dumps(payload, indent=2).encode("utf-8")
+    total_lines = sum(len(inv.lines) for inv in invoices)
+
     out = Path(cfg.output_file)
+    if cfg.encrypt_output:
+        out = out.with_name(out.name + ".enc")
+        data = crypto.encrypt(plaintext, crypto.load_key(cfg.encryption_key))
+        at_rest = "AES-encrypted (Fernet)"
+    else:
+        data = plaintext
+        at_rest = "PLAINTEXT"
+
+    _atomic_write_bytes(out, data)
+    audit.record(
+        "PERSIST",
+        resource="invoice_lines",
+        field_count=total_lines,
+        detail=f"encrypted={cfg.encrypt_output}",
+    )
+    # Counts only — never content.
+    log.info(
+        "Wrote %d invoice(s) / %d line(s) to %s [%s].",
+        len(invoices),
+        total_lines,
+        out.name,
+        at_rest,
+    )
+    return str(out)
+
+
+def _atomic_write_bytes(out: Path, data: bytes) -> None:
     if out.parent and not out.parent.exists():
         out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.write_bytes(data)
+    try:
+        os.chmod(tmp, 0o600)  # least-privilege before it becomes the live file
+    except OSError:
+        pass
     os.replace(tmp, out)
-
-    total_lines = sum(len(inv.lines) for inv in invoices)
-    # Counts only — never content.
-    log.info(
-        "Wrote %d invoice(s) / %d line(s) to output file.",
-        len(invoices),
-        total_lines,
-    )

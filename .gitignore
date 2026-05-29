@@ -3,7 +3,11 @@
 __pycache__/
 *.pyc
 invoice_lines.json
+invoice_lines.json.enc
+*.enc
+phi_audit.log
 trace.zip
 *.png
 .venv/
 venv/
+.pytest_cache/

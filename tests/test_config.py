@@ -10,11 +10,23 @@ from odoo_extract.errors import ConfigError
 
 @pytest.fixture
 def base_env(monkeypatch):
+    # Neutralize any real .env on disk so tests control the environment fully.
+    monkeypatch.setattr("odoo_extract.config.load_dotenv", lambda *a, **k: False)
     monkeypatch.setenv("ODOO_URL", "https://x.odoo.com")
     monkeypatch.setenv("ODOO_EMAIL", "a@b.com")
     monkeypatch.setenv("ODOO_PASSWORD", "s3cret")
-    # Ensure optional vars don't leak in from a real .env during tests.
-    for key in ("HEADLESS", "NO_SANDBOX", "SAVE_ARTIFACTS", "TARGET_CUSTOMER"):
+    # Encryption defaults ON and would require a key; disable for these tests
+    # unless a case opts back in.
+    monkeypatch.setenv("ENCRYPT_OUTPUT", "false")
+    # Ensure optional vars don't leak in from the process env during tests.
+    for key in (
+        "HEADLESS",
+        "NO_SANDBOX",
+        "SAVE_ARTIFACTS",
+        "TARGET_CUSTOMER",
+        "ALLOW_INSECURE_HTTP",
+        "PHI_ENCRYPTION_KEY",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -57,3 +69,30 @@ def test_password_not_in_repr(base_env):
     cfg = Config.load()
     assert "s3cret" not in repr(cfg)
     assert cfg.password == "s3cret"  # still accessible programmatically
+
+
+def test_http_rejected_without_optin(base_env, monkeypatch):
+    monkeypatch.setenv("ODOO_URL", "http://x.odoo.com")
+    with pytest.raises(ConfigError, match="TLS"):
+        Config.load()
+
+
+def test_http_allowed_with_optin(base_env, monkeypatch):
+    monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+    monkeypatch.setenv("ALLOW_INSECURE_HTTP", "true")
+    assert Config.load().url == "http://localhost:8069"
+
+
+def test_encryption_requires_key(base_env, monkeypatch):
+    monkeypatch.setenv("ENCRYPT_OUTPUT", "true")
+    monkeypatch.delenv("PHI_ENCRYPTION_KEY", raising=False)
+    with pytest.raises(ConfigError, match="PHI_ENCRYPTION_KEY"):
+        Config.load()
+
+
+def test_encryption_key_not_in_repr(base_env, monkeypatch):
+    monkeypatch.setenv("ENCRYPT_OUTPUT", "true")
+    monkeypatch.setenv("PHI_ENCRYPTION_KEY", "super-secret-key-material")
+    cfg = Config.load()
+    assert "super-secret-key-material" not in repr(cfg)
+    assert cfg.encrypt_output is True

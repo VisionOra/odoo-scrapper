@@ -6,6 +6,7 @@ import logging
 
 from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
 
+from .audit import PhiAuditLog
 from .config import Config
 from .constants import NAV_TIMEOUT_MS, is_read_response
 from .errors import ExtractionError, NavigationError, RecordNotFoundError
@@ -45,6 +46,8 @@ async def extract_all_target_invoices(
     capture: RpcCapture,
     log: logging.Logger,
     redactor: PhiRedactionFilter,
+    audit: PhiAuditLog,
+    subject: str,
 ) -> list[Invoice]:
     """
     Find EVERY invoice for the target customer and extract each one's lines.
@@ -72,7 +75,9 @@ async def extract_all_target_invoices(
     invoices: list[Invoice] = []
     for index in range(total):
         invoices.append(
-            await _extract_one(page, cfg, capture, log, redactor, index, total)
+            await _extract_one(
+                page, cfg, capture, log, redactor, audit, subject, index, total
+            )
         )
         # Return to the list for the next iteration (state-driven, no sleep).
         if index < total - 1:
@@ -87,6 +92,8 @@ async def _extract_one(
     capture: RpcCapture,
     log: logging.Logger,
     redactor: PhiRedactionFilter,
+    audit: PhiAuditLog,
+    subject: str,
     index: int,
     total: int,
 ) -> Invoice:
@@ -116,6 +123,16 @@ async def _extract_one(
             "Invoice %d/%d yielded no lines; recording empty.", index + 1, total
         )
         lines = []
+    # Audit the PHI access (§164.312(b)): WHO/WHAT/WHEN + a count — never the
+    # customer name (pseudonymized subject) or any product content.
+    audit.record(
+        "READ",
+        resource="account.move",
+        resource_id=number,
+        subject=subject,
+        field_count=len(lines),
+        outcome="SUCCESS" if lines else "EMPTY",
+    )
     log.info("Extracted invoice %d/%d.", index + 1, total)  # count only
     return Invoice(invoice_number=number, lines=lines)
 

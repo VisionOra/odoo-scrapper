@@ -36,7 +36,9 @@ def _emit(log: logging.Logger, redactor: PhiRedactionFilter, record_fn) -> str:
 def test_customer_name_redacted_via_args():
     log, redactor = build_logger("t1")
     redactor.register(["Deco Addict"], "[REDACTED_CUSTOMER]")
-    out = _emit(log, redactor, lambda: log.info("Processing customer %s", "Deco Addict"))
+    out = _emit(
+        log, redactor, lambda: log.info("Processing customer %s", "Deco Addict")
+    )
     assert "Deco Addict" not in out
     assert "[REDACTED_CUSTOMER]" in out
 

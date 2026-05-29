@@ -80,7 +80,11 @@ def _resolve_level(level: int | str | None) -> int:
     if level is None:
         level = os.getenv("LOG_LEVEL", "INFO")
     if isinstance(level, str):
-        return logging.getLevelName(level.strip().upper()) if level.strip() else logging.INFO
+        return (
+            logging.getLevelName(level.strip().upper())
+            if level.strip()
+            else logging.INFO
+        )
     return level
 
 
