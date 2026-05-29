@@ -1,23 +1,4 @@
-#!/usr/bin/env python3
 """
-The Enterprise ERP Extraction — Odoo Invoicing billing-line extractor.
-
-Implements the workflow described in SPECIFICATION.md:
-
-    AuthModule  ->  NavModule  ->  drill-down  ->  ExtractionModule  ->  JSON
-
-Hard constraints honored:
-  * No hardcoded sleeps. Every wait blocks on observable state — network
-    responses (page.expect_response on Odoo JSON-RPC), URL changes, or element
-    actionability (Playwright auto-waiting). See SPECIFICATION.md §4.
-  * Resilient locators. Selectors use Odoo field-name data attributes,
-    semantic roles, visible text, and relative XPath — never ephemeral IDs.
-    See SPECIFICATION.md §5.
-  * Hybrid extraction. Primary source is the intercepted account.move JSON-RPC
-    payload; resilient DOM scraping is the fallback. See SPECIFICATION.md §6.
-  * PHI sanitization in memory. Customer/product strings never reach the
-    console; only the final JSON file holds real values. See SPECIFICATION.md §7.
-
 Run:  python extract_invoice_lines.py
 """
 
@@ -41,8 +22,7 @@ from playwright.async_api import (
 
 from sanitizer import build_logger
 
-# JSON-RPC endpoints the Odoo web client uses for reads/searches.
-RPC_GLOB = "**/web/dataset/**"
+# JSON-RPC method names the Odoo web client uses for reads/searches.
 SEARCH_METHODS = {"web_search_read", "search_read"}
 READ_METHODS = {"web_read", "read"}
 NAV_TIMEOUT_MS = 45_000
@@ -120,6 +100,12 @@ class InvoiceLine:
     tax_amount: float
 
 
+@dataclass
+class Invoice:
+    invoice_number: str
+    lines: list[InvoiceLine]
+
+
 # --------------------------------------------------------------------------- #
 # RPC interception buffer                                                      #
 # --------------------------------------------------------------------------- #
@@ -132,6 +118,11 @@ class RpcCapture:
     def __init__(self, log) -> None:
         self._log = log
         self.last_move_record: dict | None = None
+
+    def reset(self) -> None:
+        """Clear the buffer before opening the next invoice, so each extraction
+        reads its own fresh payload rather than a stale one (multi-invoice)."""
+        self.last_move_record = None
 
     def attach(self, page: Page) -> None:
         page.on("response", self._on_response)
@@ -155,10 +146,18 @@ class RpcCapture:
 
         for rec in records:
             if isinstance(rec, dict) and "invoice_line_ids" in rec:
-                self.last_move_record = rec
+                # Prefer a record whose lines are EXPANDED (list of dicts), which
+                # is what the form-view web_read returns. The list-view
+                # search_read also has the key but as bare IDs — skip that one
+                # so we don't lock onto an unusable payload.
+                lines = rec.get("invoice_line_ids") or []
+                expanded = bool(lines) and isinstance(lines[0], dict)
+                if expanded or self.last_move_record is None:
+                    self.last_move_record = rec
                 # Non-PHI observability only: count, never content.
                 self._log.info("Captured account.move RPC payload via interception.")
-                return
+                if expanded:
+                    return
 
 
 # --------------------------------------------------------------------------- #
@@ -187,10 +186,20 @@ def _to_float(value) -> float:
 
 
 def _name_of(field) -> str:
-    """Odoo many2one fields serialize as [id, 'Display Name']."""
+    """
+    Resolve a many2one field's display name across Odoo serialization formats.
+
+    - Legacy (<=18 read):  [id, "Display Name"]
+    - Odoo 19 web_read:    {"id": .., "display_name": ".."}  (or just {"id": ..})
+    - Empty / unset:       False  ->  ""
+    """
+    if isinstance(field, dict):
+        return str(field.get("display_name") or "")
     if isinstance(field, (list, tuple)) and len(field) == 2:
         return str(field[1])
-    return str(field or "")
+    if field is False or field is None:
+        return ""
+    return str(field)
 
 
 # --------------------------------------------------------------------------- #
@@ -367,35 +376,112 @@ async def _apply_posted_via_search(page: Page, log) -> bool:
 # --------------------------------------------------------------------------- #
 # Drill-down — find the target customer's invoice (Specification §8.5)         #
 # --------------------------------------------------------------------------- #
-async def open_target_invoice(page: Page, cfg: Config, capture: RpcCapture, log) -> None:
-    """Scan dynamic rows for the target customer and open the form view."""
-    log.info("Locating target invoice row by structural relationship.")
+def _target_rows(page: Page, cfg: Config):
+    """All list rows whose Customer cell matches the target (§5).
 
-    # Resilient: find the data row that CONTAINS the customer text, then click.
-    # No reliance on row index or generated id (§5 worked example).
-    row = page.locator("tr.o_data_row").filter(has_text=cfg.target_customer).first
+    Matching is scoped to the customer field cell — not an arbitrary substring
+    across the whole row — so "Deco Addict" cannot accidentally match another
+    column or a similarly named customer elsewhere in the row.
+    """
+    customer_cell = page.locator(
+        'tr.o_data_row td[name="partner_id"], '
+        'tr.o_data_row td.o_field_cell[name="partner_id"]'
+    ).filter(has_text=cfg.target_customer)
+    # Fall back to whole-row text match if the column name differs on this build.
+    rows_by_cell = page.locator("tr.o_data_row").filter(has=customer_cell)
+    return rows_by_cell, page.locator("tr.o_data_row").filter(
+        has_text=cfg.target_customer
+    )
+
+
+async def extract_all_target_invoices(
+    page: Page, cfg: Config, capture: RpcCapture, log
+) -> list[Invoice]:
+    """
+    Find EVERY invoice for the target customer and extract each one's lines.
+
+    Clicking a row navigates to the form view, which invalidates the list-row
+    locators. We therefore (1) count matches up front, then (2) iterate by
+    index, navigating back to the list between invoices so the locators are
+    re-resolved fresh each time. The RPC buffer is reset before each open so a
+    given extraction never reads a previous invoice's payload.
+    """
+    log.info("Locating target invoice rows by structural relationship.")
+
+    primary_rows, fallback_rows = _target_rows(page, cfg)
+    rows = primary_rows if await primary_rows.count() else fallback_rows
 
     try:
-        await row.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        await rows.first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
     except PWTimeout as exc:
         raise RecordNotFoundError(
-            "Target customer invoice row not found in the current list. "
+            "No invoice row found for the target customer in the current list. "
             "Check TARGET_CUSTOMER matches a customer that has an invoice."
         ) from exc
 
-    # State trigger: opening the record fires a web_read on account.move, which
-    # RpcCapture intercepts. We await that exact response before proceeding.
-    async with page.expect_response(_is_read_response, timeout=NAV_TIMEOUT_MS):
-        await row.click()
+    total = await rows.count()
+    log.info("Found %d invoice(s) for the target customer.", total)
 
-    # Confirm the form view rendered.
-    try:
-        await page.locator(".o_form_view").first.wait_for(
-            state="visible", timeout=NAV_TIMEOUT_MS
-        )
-    except PWTimeout as exc:
-        raise NavigationError("Invoice form view did not render.") from exc
-    log.info("Opened target invoice detail view.")
+    invoices: list[Invoice] = []
+    for index in range(total):
+        # Re-resolve the row set each iteration (DOM was rebuilt after going
+        # back), then select by index. Indexes are stable within a single
+        # rendered list ordering.
+        cur_primary, cur_fallback = _target_rows(page, cfg)
+        cur_rows = cur_primary if await cur_primary.count() else cur_fallback
+        await cur_rows.first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        row = cur_rows.nth(index)
+
+        capture.reset()
+        # State trigger: opening fires a web_read on account.move (intercepted).
+        async with page.expect_response(_is_read_response, timeout=NAV_TIMEOUT_MS):
+            await row.click()
+        try:
+            await page.locator(".o_form_view").first.wait_for(
+                state="visible", timeout=NAV_TIMEOUT_MS
+            )
+        except PWTimeout as exc:
+            raise NavigationError("Invoice form view did not render.") from exc
+
+        number = await _read_invoice_number(page)
+        try:
+            lines = await extract_invoice_lines(page, capture, log)
+        except ExtractionError:
+            # One empty/odd invoice shouldn't abort the whole batch.
+            log.warning("Invoice %d/%d yielded no lines; recording empty.",
+                        index + 1, total)
+            lines = []
+        invoices.append(Invoice(invoice_number=number, lines=lines))
+        log.info("Extracted invoice %d/%d.", index + 1, total)  # count only
+
+        # Return to the list for the next iteration (state-driven, no sleep).
+        if index < total - 1:
+            await _back_to_list(page, log)
+
+    return invoices
+
+
+async def _read_invoice_number(page: Page) -> str:
+    """Read the invoice's displayed number from the form (non-PHI identifier)."""
+    candidates = page.locator(
+        '.o_form_view [name="name"] span, .o_form_view [name="name"] input, '
+        ".o_breadcrumb .active, .o_last_breadcrumb_item span"
+    )
+    if await candidates.count():
+        text = (await candidates.first.inner_text()).strip()
+        if text:
+            return text
+    return "UNKNOWN"
+
+
+async def _back_to_list(page: Page, log) -> None:
+    """Navigate back to the list view via the breadcrumb (state-driven)."""
+    crumb = page.locator(".o_breadcrumb a, .breadcrumb-item a").first
+    async with page.expect_response(_is_search_response, timeout=NAV_TIMEOUT_MS):
+        await crumb.click()
+    await page.locator(".o_list_view, .o_list_renderer").first.wait_for(
+        state="visible", timeout=NAV_TIMEOUT_MS
+    )
 
 
 def _is_read_response(resp: Response) -> bool:
@@ -419,7 +505,7 @@ async def extract_invoice_lines(
     rpc_lines = _lines_from_rpc(capture)
 
     # Fallback path: resilient DOM scrape, scoped to the lines table.
-    dom_lines = await _lines_from_dom(page, log)
+    dom_lines = await _lines_from_dom(page)
 
     primary, fallback = (rpc_lines, dom_lines)
     chosen = primary if primary else fallback
@@ -440,6 +526,18 @@ async def extract_invoice_lines(
     return chosen
 
 
+def _lines_table(page: Page):
+    """Version-tolerant locator for the invoice-lines field/table (§5).
+
+    Odoo 19 may drop the legacy `.o_field_x2many` wrapper class; the stable
+    contract is the `name="invoice_line_ids"` field attribute. We match the
+    field by name, falling back to any list table that follows it.
+    """
+    return page.locator(
+        '[name="invoice_line_ids"], .o_field_x2many[name="invoice_line_ids"]'
+    ).first
+
+
 async def _open_invoice_lines_tab(page: Page, log) -> None:
     # Tab label is "Invoice Lines" on most builds. Locate by role+name; the
     # underlying notebook page then becomes visible (auto-wait, no sleep).
@@ -449,18 +547,25 @@ async def _open_invoice_lines_tab(page: Page, log) -> None:
         tab = page.locator("a.nav-link, .o_notebook .nav-link").filter(
             has_text="Invoice Lines"
         )
-    if await tab.count() == 0:
-        # The lines table is often the default visible page; proceed if present.
-        if await page.locator('.o_field_x2many[name="invoice_line_ids"]').count():
-            log.info("Invoice Lines tab already active.")
-            return
-        raise ExtractionError("'Invoice Lines' tab could not be located.")
 
-    await tab.first.click()
-    await page.locator('.o_field_x2many[name="invoice_line_ids"]').first.wait_for(
-        state="visible", timeout=NAV_TIMEOUT_MS
-    )
-    log.info("Invoice Lines tab activated.")
+    if await tab.count():
+        # If the tab isn't already the active one, click it.
+        try:
+            await tab.first.click()
+        except Exception:
+            pass  # already active / not clickable — proceed to verify table
+
+    # Verify the lines table is present. It is often the default-visible page,
+    # so this succeeds whether or not we needed to click. We do NOT hard-fail
+    # here: the RPC interception already holds the data; the DOM is a fallback.
+    table = _lines_table(page)
+    try:
+        await table.wait_for(state="visible", timeout=15_000)
+        log.info("Invoice Lines tab active; lines table visible.")
+    except PWTimeout:
+        log.warning(
+            "Invoice Lines table not located in DOM; relying on RPC capture."
+        )
 
 
 def _lines_from_rpc(capture: RpcCapture) -> list[InvoiceLine]:
@@ -474,15 +579,24 @@ def _lines_from_rpc(capture: RpcCapture) -> list[InvoiceLine]:
 
     lines: list[InvoiceLine] = []
     for ln in raw_lines:
-        # Skip section/note lines that carry no product (display_type set).
-        if ln.get("display_type"):
+        # Odoo 19: real product lines carry display_type == "product".
+        # Section/note rows use "line_section" / "line_note" — skip only those.
+        # (Older Odoo used False/empty for product lines, so accept that too.)
+        dtype = ln.get("display_type")
+        if dtype not in (False, None, "", "product"):
             continue
         subtotal = _to_float(ln.get("price_subtotal"))
         total = _to_float(ln.get("price_total"))
         tax = round(total - subtotal, 2)
+        # Product name: many2one display name, then the line label, then a
+        # placeholder if the line has neither (e.g. an empty test line).
+        name = _name_of(ln.get("product_id"))
+        if not name:
+            label = ln.get("name")
+            name = label if isinstance(label, str) and label else "(no product)"
         lines.append(
             InvoiceLine(
-                product_name=_name_of(ln.get("product_id")) or ln.get("name", ""),
+                product_name=name,
                 quantity=_to_float(ln.get("quantity")),
                 unit_price=_to_float(ln.get("price_unit")),
                 tax_amount=tax,
@@ -491,9 +605,9 @@ def _lines_from_rpc(capture: RpcCapture) -> list[InvoiceLine]:
     return lines
 
 
-async def _lines_from_dom(page: Page, log) -> list[InvoiceLine]:
+async def _lines_from_dom(page: Page) -> list[InvoiceLine]:
     """Scrape the rendered lines table by column FIELD NAME, not index (§6)."""
-    table = page.locator('.o_field_x2many[name="invoice_line_ids"]').first
+    table = _lines_table(page)
     if await table.count() == 0:
         return []
 
@@ -536,7 +650,7 @@ async def _cell_text(row, field_name: str) -> str:
 # --------------------------------------------------------------------------- #
 # Orchestrator (Specification §8)                                             #
 # --------------------------------------------------------------------------- #
-async def run(cfg: Config, log, redactor) -> list[InvoiceLine]:
+async def run(cfg: Config, log, redactor) -> list[Invoice]:
     # Register PHI terms up front so anything logged later is auto-redacted.
     redactor.register([cfg.target_customer], "[REDACTED_CUSTOMER]")
 
@@ -563,13 +677,14 @@ async def run(cfg: Config, log, redactor) -> list[InvoiceLine]:
             await open_invoicing(page, cfg, log)
             await clear_default_filters(page, log)
             await apply_posted_filter(page, log)
-            await open_target_invoice(page, cfg, capture, log)
-            lines = await extract_invoice_lines(page, capture, log)
+            invoices = await extract_all_target_invoices(page, cfg, capture, log)
 
-            # Register extracted product names so any later log line is scrubbed.
-            redactor.register([ln.product_name for ln in lines], "[REDACTED_PRODUCT]")
+            # Register every extracted product name so any later log line is
+            # scrubbed (PHI guardrail across all invoices).
+            all_products = [ln.product_name for inv in invoices for ln in inv.lines]
+            redactor.register(all_products, "[REDACTED_PRODUCT]")
             await context.tracing.stop()
-            return lines
+            return invoices
         except Exception:
             # Persist debugging artifacts locally only (§10).
             await _dump_artifacts(context, page, log)
@@ -587,11 +702,21 @@ async def _dump_artifacts(context: BrowserContext, page: Page, log) -> None:
         pass
 
 
-def write_output(lines: list[InvoiceLine], cfg: Config, log) -> None:
-    """Serialize REAL values straight to disk — never through the logger (§7)."""
-    payload = [asdict(ln) for ln in lines]
+def write_output(invoices: list[Invoice], cfg: Config, log) -> None:
+    """Serialize REAL values straight to disk — never through the logger (§7).
+
+    Output is an array of invoices, each with its own lines, so multiple
+    invoices for the same customer are all represented distinctly.
+    """
+    payload = [asdict(inv) for inv in invoices]
     Path(cfg.output_file).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    log.info("Wrote %d line(s) to output file.", len(lines))  # count only
+    total_lines = sum(len(inv.lines) for inv in invoices)
+    # Counts only — never content.
+    log.info(
+        "Wrote %d invoice(s) / %d line(s) to output file.",
+        len(invoices),
+        total_lines,
+    )
 
 
 def main() -> int:
@@ -603,8 +728,8 @@ def main() -> int:
         return 2
 
     try:
-        lines = asyncio.run(run(cfg, log, redactor))
-        write_output(lines, cfg, log)
+        invoices = asyncio.run(run(cfg, log, redactor))
+        write_output(invoices, cfg, log)
         log.info("Done.")
         return 0
     except WorkflowError as exc:

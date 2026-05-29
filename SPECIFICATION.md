@@ -214,20 +214,35 @@ while the JSON file still holds the true value.
 
 ## 9. Output Schema
 
+The output is an **array of invoices**, because a customer may have more than one
+invoice. Each invoice carries its identifying number and its own line array:
+
 ```json
 [
   {
-    "product_name": "string",
-    "quantity": 0.0,
-    "unit_price": 0.0,
-    "tax_amount": 0.0
+    "invoice_number": "INV/2026/00001",
+    "lines": [
+      {
+        "product_name": "string",
+        "quantity": 0.0,
+        "unit_price": 0.0,
+        "tax_amount": 0.0
+      }
+    ]
   }
 ]
 ```
 
-Field names mirror the challenge's required columns verbatim — *Product Name*,
+Line field names mirror the challenge's required columns verbatim — *Product Name*,
 *Quantity*, *Unit Price*, *Tax Amount* — in snake_case. All numeric fields are floats;
 currency symbols and thousands separators are stripped during normalization.
+
+**Multiple invoices per customer:** the script counts all matching rows up front, then
+iterates by index — opening each invoice, extracting its lines, and navigating back to
+the list (all state-driven, no sleep) before the next. The RPC capture buffer is reset
+before each open so an extraction never reads a previous invoice's payload. Customer
+matching is scoped to the *Customer* column cell, not a whole-row substring, so similar
+names in other columns cannot cause a false match.
 
 ---
 
