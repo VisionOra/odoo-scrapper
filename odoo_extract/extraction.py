@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from playwright.async_api import Page, TimeoutError as PWTimeout
+import logging
 
+from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
+
+from .constants import FORM_TIMEOUT_MS
 from .errors import ExtractionError
 from .models import InvoiceLine
 from .parsing import name_of, to_float
 from .rpc_capture import RpcCapture
+from .sanitizer import PhiRedactionFilter
 
 
 async def extract_invoice_lines(
-    page: Page, capture: RpcCapture, log
+    page: Page,
+    capture: RpcCapture,
+    log: logging.Logger,
+    redactor: PhiRedactionFilter,
 ) -> list[InvoiceLine]:
     # Activate the Invoice Lines tab by its accessible NAME, not index (§5).
     await _open_invoice_lines_tab(page, log)
@@ -30,6 +37,11 @@ async def extract_invoice_lines(
             "No invoice lines could be extracted (RPC and DOM empty)."
         )
 
+    # Register product names with the redactor the MOMENT they exist in memory,
+    # *before* any further log call. This makes the PHI guarantee structural:
+    # even an accidental future log of a product name is scrubbed (§7).
+    redactor.register([ln.product_name for ln in chosen], "[REDACTED_PRODUCT]")
+
     # Reconciliation: warn (sanitized) if the two sources disagree on count.
     if primary and fallback and len(primary) != len(fallback):
         log.warning(
@@ -43,7 +55,7 @@ async def extract_invoice_lines(
     return chosen
 
 
-def _lines_table(page: Page):
+def _lines_table(page: Page) -> Locator:
     """Version-tolerant locator for the invoice-lines field/table (§5).
 
     Odoo 19 may drop the legacy `.o_field_x2many` wrapper class; the stable
@@ -55,7 +67,7 @@ def _lines_table(page: Page):
     ).first
 
 
-async def _open_invoice_lines_tab(page: Page, log) -> None:
+async def _open_invoice_lines_tab(page: Page, log: logging.Logger) -> None:
     # Tab label is "Invoice Lines" on most builds. Locate by role+name; the
     # underlying notebook page then becomes visible (auto-wait, no sleep).
     tab = page.get_by_role("tab", name="Invoice Lines")
@@ -69,7 +81,7 @@ async def _open_invoice_lines_tab(page: Page, log) -> None:
         # If the tab isn't already the active one, click it.
         try:
             await tab.first.click()
-        except Exception:
+        except PWTimeout:
             pass  # already active / not clickable — proceed to verify table
 
     # Verify the lines table is present. It is often the default-visible page,
@@ -77,7 +89,7 @@ async def _open_invoice_lines_tab(page: Page, log) -> None:
     # here: the RPC interception already holds the data; the DOM is a fallback.
     table = _lines_table(page)
     try:
-        await table.wait_for(state="visible", timeout=15_000)
+        await table.wait_for(state="visible", timeout=FORM_TIMEOUT_MS)
         log.info("Invoice Lines tab active; lines table visible.")
     except PWTimeout:
         log.warning("Invoice Lines table not located in DOM; relying on RPC capture.")
@@ -151,9 +163,8 @@ async def _lines_from_dom(page: Page) -> list[InvoiceLine]:
     return lines
 
 
-async def _cell_text(row, field_name: str) -> str:
+async def _cell_text(row: Locator, field_name: str) -> str:
     cell = row.locator(f'[name="{field_name}"]')
     if await cell.count() == 0:
         return ""
-    text = (await cell.first.inner_text()).strip()
-    return text
+    return (await cell.first.inner_text()).strip()

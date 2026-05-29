@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import logging
+import re
+
 from playwright.async_api import Page, TimeoutError as PWTimeout
 
 from .config import Config
-from .constants import NAV_TIMEOUT_MS, is_search_response
+from .constants import NAV_TIMEOUT_MS, SHORT_TIMEOUT_MS, is_search_response
 from .errors import NavigationError
 
+# Safety bound so a misbehaving remove-control can never spin forever.
+MAX_FACET_REMOVALS = 25
 
-async def open_invoicing(page: Page, cfg: Config, log) -> None:
+
+async def open_invoicing(page: Page, cfg: Config, log: logging.Logger) -> None:
     """Navigate to the Customer Invoices list via the stable action URL."""
     log.info("Opening Invoicing module.")
     # Customer Invoices list (account.move, out_invoice). The /odoo/customer-invoices
@@ -31,29 +37,39 @@ async def open_invoicing(page: Page, cfg: Config, log) -> None:
     log.info("Invoicing list view is visible.")
 
 
-async def clear_default_filters(page: Page, log) -> None:
+async def clear_default_filters(page: Page, log: logging.Logger) -> None:
     """
     Remove every pre-applied search facet so filtering is idempotent (§10).
+
     Facets are the chips inside the search bar; we close each via its remove
-    button, located structurally (role/text), never by generated id.
+    button, located structurally (role/text), never by generated id. Each
+    removal's signal is the control detaching from the DOM — not a network
+    response, since a removal may re-render the list from the in-memory model.
+    The loop is bounded by ``MAX_FACET_REMOVALS`` to preclude a spin.
     """
-    # Search bar container — role-based with class fallback (Odoo 16→19).
     search_box = page.locator('[role="search"], .o_searchview, .o_cp_searchview').first
     await search_box.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
 
-    # Each facet exposes a remove control. In Odoo 19 it carries an aria-label
-    # ("Remove"); older builds use the .o_facet_remove class. We match either,
-    # accessibility-first. Loop until none remain — each removal triggers a
-    # fresh search_read which the list awaits via re-render (no sleep).
-    while True:
+    for _ in range(MAX_FACET_REMOVALS):
         facet_remove = search_box.locator(
             ".o_facet_remove, .o_searchview_facet .o_facet_remove, "
             'button[aria-label="Remove"], [role="img"][aria-label="Remove"]'
         )
         if await facet_remove.count() == 0:
             break
-        async with page.expect_response(is_search_response, timeout=NAV_TIMEOUT_MS):
-            await facet_remove.first.click()
+        btn = facet_remove.first
+        await btn.click()
+        # Wait for THIS control to detach (the facet is gone), so we don't race
+        # the next iteration's count against a not-yet-updated DOM.
+        try:
+            await btn.wait_for(state="detached", timeout=SHORT_TIMEOUT_MS)
+        except PWTimeout:
+            pass
+    else:
+        log.warning(
+            "Stopped clearing search facets after %d iterations.", MAX_FACET_REMOVALS
+        )
+        return
     log.info("Default search filters cleared.")
 
 
@@ -61,23 +77,31 @@ async def _visible_row_count(page: Page) -> int:
     return await page.locator("tr.o_data_row").count()
 
 
-async def apply_posted_filter(page: Page, log) -> None:
+async def apply_posted_filter(page: Page, log: logging.Logger) -> None:
     """
     Apply the Posted status filter (§8.4), self-healing.
 
     Primary: the 'Filters' dropdown exposes a 'Posted' filter on account.move.
-    Fallback: type 'Posted' into the search input and pick the suggested
-    *Status* facet from the autocomplete (label-agnostic).
+    Fallback: pick the *Status* facet from the search-input autocomplete.
+
+    If neither control can apply a genuine *Status = Posted* facet we proceed
+    with the unfiltered list and say so loudly — we never silently apply a
+    free-text "contains Posted" search and pass it off as a status filter.
 
     Self-heal: if applying the filter empties the list (e.g. the only invoice is
     still in Draft on this instance), the filter is removed again so the
-    workflow can still drill into the available record. A sanitized notice is
-    logged. This keeps the script runnable across instances regardless of
-    whether demo/posted data is present.
+    workflow can still drill into the available record.
     """
-    applied = await _apply_posted_via_dropdown(page, log)
-    if not applied:
-        applied = await _apply_posted_via_search(page, log)
+    if await _apply_posted_via_dropdown(page, log):
+        applied = True
+    elif await _apply_posted_via_search(page, log):
+        applied = True
+    else:
+        applied = False
+        log.warning(
+            "Could not apply a 'Posted' status filter via any known control; "
+            "proceeding with the unfiltered list."
+        )
 
     if applied and await _visible_row_count(page) == 0:
         log.warning(
@@ -87,10 +111,10 @@ async def apply_posted_filter(page: Page, log) -> None:
         await clear_default_filters(page, log)
 
 
-async def _apply_posted_via_dropdown(page: Page, log) -> bool:
+async def _apply_posted_via_dropdown(page: Page, log: logging.Logger) -> bool:
     filters_toggle = page.get_by_role("button", name="Filters")
     try:
-        await filters_toggle.wait_for(state="visible", timeout=8_000)
+        await filters_toggle.wait_for(state="visible", timeout=SHORT_TIMEOUT_MS)
     except PWTimeout:
         return False
     await filters_toggle.click()
@@ -110,7 +134,14 @@ async def _apply_posted_via_dropdown(page: Page, log) -> bool:
     return True
 
 
-async def _apply_posted_via_search(page: Page, log) -> bool:
+async def _apply_posted_via_search(page: Page, log: logging.Logger) -> bool:
+    """Fallback: select a real *Status* facet from the search autocomplete.
+
+    Crucially we only accept an autocomplete option that represents a Status
+    field filter — never a free-text "Search … for: Posted" row, and never a
+    blind Enter press (which would create a content search, not a status
+    filter). If no genuine Status option appears, we decline (return False).
+    """
     search_input = page.locator(
         '[role="search"] input, .o_searchview input.o_searchview_input, '
         ".o_cp_searchview input"
@@ -119,20 +150,36 @@ async def _apply_posted_via_search(page: Page, log) -> bool:
     await search_input.click()
     await search_input.fill("Posted")
 
-    # Autocomplete suggests a "Status > Posted" facet; pick it by text.
-    suggestion = page.locator(
+    dropdown = page.locator(
         ".o_searchview_autocomplete, .o-autocomplete--dropdown-menu, .dropdown-menu"
-    ).get_by_text("Posted", exact=False)
-    async with page.expect_response(is_search_response, timeout=NAV_TIMEOUT_MS):
-        if await suggestion.count():
-            await suggestion.first.click()
-        else:
-            await search_input.press("Enter")
+    ).first
+    try:
+        await dropdown.wait_for(state="visible", timeout=SHORT_TIMEOUT_MS)
+    except PWTimeout:
+        return False
 
-    # Confirm the 'Posted' facet is now present in the search bar.
+    # Accept a Status-category suggestion; exclude the free-text search row
+    # (which reads "Search … for:"). Match on the Status group label.
+    options = dropdown.get_by_role("option")
+    if await options.count() == 0:
+        options = dropdown.locator("li, .o_menu_item, .dropdown-item")
+    status_option = options.filter(has_text=re.compile(r"status", re.I)).filter(
+        has_not_text=re.compile(r"search", re.I)
+    )
+    if await status_option.count() == 0:
+        await page.keyboard.press("Escape")
+        return False
+
+    async with page.expect_response(is_search_response, timeout=NAV_TIMEOUT_MS):
+        await status_option.first.click()
+
+    # Confirm a 'Posted' facet is now present in the search bar.
     facet = page.locator(
         '[role="search"], .o_searchview, .o_cp_searchview'
     ).get_by_text("Posted", exact=False)
-    await facet.first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+    try:
+        await facet.first.wait_for(state="visible", timeout=SHORT_TIMEOUT_MS)
+    except PWTimeout:
+        return False
     log.info("Applied 'Posted' status filter.")
     return True

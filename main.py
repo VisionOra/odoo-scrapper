@@ -31,10 +31,12 @@ def main() -> int:
         log.info("Done.")
         return 0
     except WorkflowError as exc:
+        # Typed, expected failure — message is actionable; no stack needed.
         log.error("Workflow failed: %s", exc)
         return 1
-    except Exception as exc:  # noqa: BLE001 — top-level safety net
-        log.error("Unexpected error: %s", exc)
+    except Exception:  # noqa: BLE001 — top-level safety net
+        # Unexpected: keep the full (PHI-scrubbed) traceback for diagnosis.
+        log.exception("Unexpected error")
         return 1
 
 

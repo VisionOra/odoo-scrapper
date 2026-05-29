@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from playwright.async_api import Page
 
 from .config import Config
@@ -9,7 +11,7 @@ from .constants import NAV_TIMEOUT_MS
 from .errors import AuthError
 
 
-async def authenticate(page: Page, cfg: Config, log) -> None:
+async def authenticate(page: Page, cfg: Config, log: logging.Logger) -> None:
     log.info("Navigating to login page.")
     await page.goto(f"{cfg.url}/web/login", wait_until="domcontentloaded")
 

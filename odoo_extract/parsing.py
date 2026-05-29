@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-def to_float(value) -> float:
+def to_float(value: object) -> float:
     """Normalize a numeric/currency string or number to float (§9)."""
     if isinstance(value, (int, float)):
         return float(value)
@@ -25,7 +25,7 @@ def to_float(value) -> float:
         return 0.0
 
 
-def name_of(field) -> str:
+def name_of(field: object) -> str:
     """
     Resolve a many2one field's display name across Odoo serialization formats.
 

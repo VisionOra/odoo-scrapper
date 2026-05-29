@@ -2,36 +2,49 @@
 
 from __future__ import annotations
 
-from playwright.async_api import Page, TimeoutError as PWTimeout
+import logging
+
+from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
 
 from .config import Config
-from .constants import NAV_TIMEOUT_MS, is_read_response, is_search_response
+from .constants import NAV_TIMEOUT_MS, is_read_response
 from .errors import ExtractionError, NavigationError, RecordNotFoundError
 from .extraction import extract_invoice_lines
 from .models import Invoice
 from .rpc_capture import RpcCapture
+from .sanitizer import PhiRedactionFilter
 
 
-def _target_rows(page: Page, cfg: Config):
+def _target_rows(page: Page, cfg: Config) -> tuple[Locator, Locator]:
     """All list rows whose Customer cell matches the target (§5).
 
     Matching is scoped to the customer field cell — not an arbitrary substring
-    across the whole row — so "Deco Addict" cannot accidentally match another
-    column or a similarly named customer elsewhere in the row.
+    across the whole row — so the target name cannot accidentally match another
+    column or a similarly named customer elsewhere in the row. Returns
+    ``(scoped, whole_row)``; the caller prefers the scoped match and falls back
+    to the whole-row match if the column name differs on this build.
     """
     customer_cell = page.locator(
         'tr.o_data_row td[name="partner_id"], '
         'tr.o_data_row td.o_field_cell[name="partner_id"]'
     ).filter(has_text=cfg.target_customer)
-    # Fall back to whole-row text match if the column name differs on this build.
     rows_by_cell = page.locator("tr.o_data_row").filter(has=customer_cell)
-    return rows_by_cell, page.locator("tr.o_data_row").filter(
-        has_text=cfg.target_customer
-    )
+    rows_by_text = page.locator("tr.o_data_row").filter(has_text=cfg.target_customer)
+    return rows_by_cell, rows_by_text
+
+
+async def _resolve_rows(page: Page, cfg: Config) -> Locator:
+    """Pick the scoped row set if it matches, else the whole-row fallback."""
+    scoped, whole_row = _target_rows(page, cfg)
+    return scoped if await scoped.count() else whole_row
 
 
 async def extract_all_target_invoices(
-    page: Page, cfg: Config, capture: RpcCapture, log
+    page: Page,
+    cfg: Config,
+    capture: RpcCapture,
+    log: logging.Logger,
+    redactor: PhiRedactionFilter,
 ) -> list[Invoice]:
     """
     Find EVERY invoice for the target customer and extract each one's lines.
@@ -44,9 +57,7 @@ async def extract_all_target_invoices(
     """
     log.info("Locating target invoice rows by structural relationship.")
 
-    primary_rows, fallback_rows = _target_rows(page, cfg)
-    rows = primary_rows if await primary_rows.count() else fallback_rows
-
+    rows = await _resolve_rows(page, cfg)
     try:
         await rows.first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
     except PWTimeout as exc:
@@ -60,7 +71,9 @@ async def extract_all_target_invoices(
 
     invoices: list[Invoice] = []
     for index in range(total):
-        invoices.append(await _extract_one(page, cfg, capture, log, index, total))
+        invoices.append(
+            await _extract_one(page, cfg, capture, log, redactor, index, total)
+        )
         # Return to the list for the next iteration (state-driven, no sleep).
         if index < total - 1:
             await _back_to_list(page, log)
@@ -69,12 +82,17 @@ async def extract_all_target_invoices(
 
 
 async def _extract_one(
-    page: Page, cfg: Config, capture: RpcCapture, log, index: int, total: int
+    page: Page,
+    cfg: Config,
+    capture: RpcCapture,
+    log: logging.Logger,
+    redactor: PhiRedactionFilter,
+    index: int,
+    total: int,
 ) -> Invoice:
     # Re-resolve the row set each iteration (DOM was rebuilt after going back),
     # then select by index. Indexes are stable within a single rendered order.
-    cur_primary, cur_fallback = _target_rows(page, cfg)
-    cur_rows = cur_primary if await cur_primary.count() else cur_fallback
+    cur_rows = await _resolve_rows(page, cfg)
     await cur_rows.first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
     row = cur_rows.nth(index)
 
@@ -91,7 +109,7 @@ async def _extract_one(
 
     number = await _read_invoice_number(page)
     try:
-        lines = await extract_invoice_lines(page, capture, log)
+        lines = await extract_invoice_lines(page, capture, log, redactor)
     except ExtractionError:
         # One empty/odd invoice shouldn't abort the whole batch.
         log.warning(
@@ -115,11 +133,19 @@ async def _read_invoice_number(page: Page) -> str:
     return "UNKNOWN"
 
 
-async def _back_to_list(page: Page, log) -> None:
-    """Navigate back to the list view via the breadcrumb (state-driven)."""
+async def _back_to_list(page: Page, log: logging.Logger) -> None:
+    """Navigate back to the list view via the breadcrumb (state-driven).
+
+    The list view becoming visible — and its first data row repainting — is the
+    authoritative signal. We do NOT wait on a search RPC here: Odoo's OWL client
+    frequently rebuilds the list from its in-memory model with no network round
+    trip, which would make an ``expect_response`` hang until timeout.
+    """
     crumb = page.locator(".o_breadcrumb a, .breadcrumb-item a").first
-    async with page.expect_response(is_search_response, timeout=NAV_TIMEOUT_MS):
-        await crumb.click()
+    await crumb.click()
     await page.locator(".o_list_view, .o_list_renderer").first.wait_for(
+        state="visible", timeout=NAV_TIMEOUT_MS
+    )
+    await page.locator("tr.o_data_row").first.wait_for(
         state="visible", timeout=NAV_TIMEOUT_MS
     )
