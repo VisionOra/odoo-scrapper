@@ -1,18 +1,3 @@
-"""
-PHI sanitization layer (Specification §7 — The HIPAA Twist).
-
-Redaction happens at the *logging boundary*, not at call sites. This is a
-structural guardrail: even if a future developer logs a sensitive variable, the
-filter scrubs it before it ever reaches a console/stream handler.
-
-Two complementary mechanisms:
-  1. PhiRedactionFilter  — regex substitution over every emitted LogRecord.
-  2. The `extra={"phi": {...}}` discipline — sensitive payloads are passed as a
-     separate dict that the formatter drops entirely (never rendered).
-
-The real, unsanitized data is NEVER routed through the logger. It lives only in
-local variables and is serialized directly to the JSON file.
-"""
 
 from __future__ import annotations
 

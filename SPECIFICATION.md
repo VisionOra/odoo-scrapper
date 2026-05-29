@@ -276,7 +276,7 @@ Run:
 ```bash
 pip install -r requirements.txt
 playwright install chromium
-python extract_invoice_lines.py
+python main.py
 ```
 
 Produces `invoice_lines.json` in the project root.

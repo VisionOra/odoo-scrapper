@@ -12,10 +12,16 @@ See [SPECIFICATION.md](SPECIFICATION.md) for the full design rationale.
 | File | Purpose |
 |------|---------|
 | `SPECIFICATION.md` | Professional specification document (deliverable 1) |
-| `extract_invoice_lines.py` | Main async Playwright workflow (deliverable 2) |
-| `sanitizer.py` | In-memory PHI redaction logging layer (§7) |
+| `main.py` | Entry point — wires config, logging, and error handling |
+| `odoo_extract/` | Async Playwright workflow, split into focused modules (deliverable 2) |
+| `odoo_extract/sanitizer.py` | In-memory PHI redaction logging layer (§7) |
 | `requirements.txt` | Pinned dependencies |
 | `.env.example` | Configuration template (copy to `.env`) |
+
+The `odoo_extract` package is organized one responsibility per module:
+`config`, `errors`, `models`, `constants`, `parsing`, `rpc_capture`, `auth`,
+`navigation`, `extraction`, `drilldown`, and `orchestrator`. Each file is kept
+under 200 lines.
 
 ## Setup
 
@@ -42,7 +48,7 @@ cp .env.example .env        # then fill in ODOO_URL / EMAIL / PASSWORD
 ## Run
 
 ```bash
-python extract_invoice_lines.py
+python main.py
 ```
 
 Produces `invoice_lines.json`:
